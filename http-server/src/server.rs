@@ -26,6 +26,7 @@
 
 use std::future::Future;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -451,95 +452,104 @@ impl<M: Middleware> Server<M> {
 					// Run some validation on the http request, then read the body and try to deserialize it into one of
 					// two cases: a single RPC request or a batch of RPC requests.
 					async move {
-						let keys = request.headers().keys().map(|k| k.as_str());
-						let cors_request_headers = http_helpers::get_cors_request_headers(request.headers());
+						let future = AssertUnwindSafe(async move {
+							let keys = request.headers().keys().map(|k| k.as_str());
+							let cors_request_headers = http_helpers::get_cors_request_headers(request.headers());
 
-						let host = match http_helpers::read_header_value(request.headers(), "host") {
-							Some(origin) => origin,
-							None => return Ok(malformed()),
-						};
-						let maybe_origin = http_helpers::read_header_value(request.headers(), "origin");
+							let host = match http_helpers::read_header_value(request.headers(), "host") {
+								Some(origin) => origin,
+								None => return Ok(malformed()),
+							};
+							let maybe_origin = http_helpers::read_header_value(request.headers(), "origin");
 
-						if let Err(e) = acl.verify_host(host) {
-							tracing::warn!("Denied request: {:?}", e);
-							return Ok(response::host_not_allowed());
-						}
-
-						if let Err(e) = acl.verify_origin(maybe_origin, host) {
-							tracing::warn!("Denied request: {:?}", e);
-							return Ok(response::invalid_allow_origin());
-						}
-
-						if let Err(e) = acl.verify_headers(keys, cors_request_headers) {
-							tracing::warn!("Denied request: {:?}", e);
-							return Ok(response::invalid_allow_headers());
-						}
-
-						// Only `POST` and `OPTIONS` methods are allowed.
-						match *request.method() {
-							// An OPTIONS request is a CORS preflight request. We've done our access check
-							// above so we just need to tell the browser that the request is OK.
-							Method::OPTIONS => {
-								let origin = match maybe_origin {
-									Some(origin) => origin,
-									None => return Ok(malformed()),
-								};
-
-								let allowed_headers = acl.allowed_headers().to_cors_header_value();
-								let allowed_header_bytes = allowed_headers.as_bytes();
-
-								let res = hyper::Response::builder()
-									.header("access-control-allow-origin", origin)
-									.header("access-control-allow-methods", "POST")
-									.header("access-control-allow-headers", allowed_header_bytes)
-									.body(hyper::Body::empty())
-									.unwrap_or_else(|e| {
-										tracing::error!("Error forming preflight response: {}", e);
-										internal_error()
-									});
-
-								Ok(res)
+							if let Err(e) = acl.verify_host(host) {
+								tracing::warn!("Denied request: {:?}", e);
+								return Ok(response::host_not_allowed());
 							}
-							// The actual request. If it's a CORS request we need to remember to add
-							// the access-control-allow-origin header (despite preflight) to allow it
-							// to be read in a browser.
-							Method::POST if content_type_is_json(&request) => {
-								let origin = return_origin_if_different_from_host(request.headers()).cloned();
-								let mut res = process_validated_request(ProcessValidatedRequest {
-									request,
-									middleware,
-									methods,
-									resources,
-									max_request_body_size,
-									max_response_body_size,
-									max_log_length,
-									batch_requests_supported,
-									request_start,
-								})
-								.await?;
 
-								if let Some(origin) = origin {
-									res.headers_mut().insert("access-control-allow-origin", origin);
+							if let Err(e) = acl.verify_origin(maybe_origin, host) {
+								tracing::warn!("Denied request: {:?}", e);
+								return Ok(response::invalid_allow_origin());
+							}
+
+							if let Err(e) = acl.verify_headers(keys, cors_request_headers) {
+								tracing::warn!("Denied request: {:?}", e);
+								return Ok(response::invalid_allow_headers());
+							}
+
+							// Only `POST` and `OPTIONS` methods are allowed.
+							match *request.method() {
+								// An OPTIONS request is a CORS preflight request. We've done our access check
+								// above so we just need to tell the browser that the request is OK.
+								Method::OPTIONS => {
+									let origin = match maybe_origin {
+										Some(origin) => origin,
+										None => return Ok(malformed()),
+									};
+
+									let allowed_headers = acl.allowed_headers().to_cors_header_value();
+									let allowed_header_bytes = allowed_headers.as_bytes();
+
+									let res = hyper::Response::builder()
+										.header("access-control-allow-origin", origin)
+										.header("access-control-allow-methods", "POST")
+										.header("access-control-allow-headers", allowed_header_bytes)
+										.body(hyper::Body::empty())
+										.unwrap_or_else(|e| {
+											tracing::error!("Error forming preflight response: {}", e);
+											internal_error()
+										});
+
+									Ok(res)
 								}
-								Ok(res)
-							}
-							Method::GET => match health_api.as_ref() {
-								Some(health) if health.path.as_str() == request.uri().path() => {
-									process_health_request(
-										health,
+								// The actual request. If it's a CORS request we need to remember to add
+								// the access-control-allow-origin header (despite preflight) to allow it
+								// to be read in a browser.
+								Method::POST if content_type_is_json(&request) => {
+									let origin = return_origin_if_different_from_host(request.headers()).cloned();
+									let mut res = process_validated_request(ProcessValidatedRequest {
+										request,
 										middleware,
 										methods,
+										resources,
+										max_request_body_size,
 										max_response_body_size,
-										request_start,
 										max_log_length,
-									)
-									.await
+										batch_requests_supported,
+										request_start,
+									})
+									.await?;
+
+									if let Some(origin) = origin {
+										res.headers_mut().insert("access-control-allow-origin", origin);
+									}
+									Ok(res)
 								}
+								Method::GET => match health_api.as_ref() {
+									Some(health) if health.path.as_str() == request.uri().path() => {
+										process_health_request(
+											health,
+											middleware,
+											methods,
+											max_response_body_size,
+											request_start,
+											max_log_length,
+										)
+										.await
+									}
+									_ => Ok(response::method_not_allowed()),
+								},
+								// Error scenarios:
+								Method::POST => Ok(response::unsupported_content_type()),
 								_ => Ok(response::method_not_allowed()),
-							},
-							// Error scenarios:
-							Method::POST => Ok(response::unsupported_content_type()),
-							_ => Ok(response::method_not_allowed()),
+							}
+						});
+						match future.catch_unwind().await {
+							Ok(resp) => resp,
+							Err(panic_err) => {
+								tracing::error!("Jsonrpsee panicked at serving request: {:?}", panic_err);
+								Ok(response::malformed())
+							}
 						}
 					}
 				}))
